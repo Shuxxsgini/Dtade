@@ -1,0 +1,92 @@
+"""Security tests: unit tests for the helpers + integration tests for protected routes."""
+from datetime import datetime, timedelta, timezone
+
+import jwt
+
+from app.core.config import settings
+from app.core.security import create_access_token, decode_access_token, hash_password, verify_password
+
+
+# ---------- Unit tests: one function at a time, no HTTP, no database ----------
+def test_hash_is_not_plain_text():
+    hashed = hash_password("secret123")
+    assert hashed != "secret123"
+    assert hashed.startswith("$argon2")                         # stored as an Argon2 hash
+
+
+def test_verify_password():
+    hashed = hash_password("secret123")
+    assert verify_password("secret123", hashed) is True
+    assert verify_password("wrongpass1", hashed) is False
+
+
+def test_token_round_trip():
+    assert decode_access_token(create_access_token(42)) == 42   # what goes in comes out
+
+
+# ---------- Integration: bad or missing tokens ----------
+def test_no_token_is_rejected(client):
+    assert client.get("/api/users/me").status_code == 401
+    assert client.get("/api/cart").status_code == 401
+    assert client.post("/api/cart/add", json={"product_id": 1, "quantity": 1}).status_code == 401
+    assert client.post("/api/orders/checkout", json={"payment_method": "UPI"}).status_code == 401
+    assert client.get("/api/orders/me").status_code == 401
+
+
+def test_wrong_scheme_is_rejected(client):
+    r = client.get("/api/users/me", headers={"Authorization": "Basic abc123"})   # not "Bearer"
+    assert r.status_code == 401
+    assert r.json()["detail"] == "Not authenticated"
+
+
+def test_garbage_token_is_rejected(client):
+    r = client.get("/api/users/me", headers={"Authorization": "Bearer abc.def.ghi"})
+    assert r.status_code == 401
+    assert r.json()["detail"] == "Invalid token"
+
+
+def test_expired_token_is_rejected(client, registered_user):
+    old_time = datetime.now(timezone.utc) - timedelta(minutes=1)            # expired 1 minute ago
+    token = jwt.encode({"sub": "1", "exp": old_time}, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+    r = client.get("/api/users/me", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 401
+    assert r.json()["detail"] == "Token has expired"
+
+
+def test_token_signed_with_wrong_key_is_rejected(client):
+    future = datetime.now(timezone.utc) + timedelta(minutes=5)
+    token = jwt.encode({"sub": "1", "exp": future}, "x" * 64, algorithm="HS256")   # a forger's key
+    r = client.get("/api/users/me", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 401
+    assert r.json()["detail"] == "Invalid token"
+
+
+def test_token_for_missing_user_is_rejected(client):
+    token = create_access_token(99999)                                      # valid token, but no such user
+    r = client.get("/api/users/me", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 401
+    assert r.json()["detail"] == "User no longer exists"
+
+
+# ---------- Integration: users can't touch each other's data ----------
+def test_cannot_touch_another_users_cart_item(client, auth_headers, other_headers):
+    item_id = client.post("/api/cart/add", json={"product_id": 2, "quantity": 1},
+                          headers=auth_headers).json()["cart_item_id"]       # main user's item
+
+    assert client.put(f"/api/cart/update/{item_id}", json={"quantity": 3},
+                      headers=other_headers).status_code == 404               # other user can't edit it
+    assert client.delete(f"/api/cart/remove/{item_id}", headers=other_headers).status_code == 404
+    assert client.get("/api/cart", headers=other_headers).json() == []      # and can't see it
+
+    mine = client.get("/api/cart", headers=auth_headers).json()
+    assert mine[0]["quantity"] == 1                                          # unchanged
+    client.delete(f"/api/cart/remove/{item_id}", headers=auth_headers)      # clean up
+
+
+def test_cannot_see_another_users_order(client, auth_headers, other_headers):
+    client.post("/api/cart/add", json={"product_id": 2, "quantity": 1}, headers=auth_headers)
+    order_id = client.post("/api/orders/checkout", json={"payment_method": "UPI"},
+                           headers=auth_headers).json()["order_id"]          # main user's order
+
+    assert client.get(f"/api/orders/details/{order_id}", headers=other_headers).status_code == 404
+    assert client.get("/api/orders/me", headers=other_headers).json() == []
