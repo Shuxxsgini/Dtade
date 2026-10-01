@@ -1,0 +1,50 @@
+"""Shared test setup: a separate SQLite database + ready-made login tokens."""
+import os
+
+os.environ["DATABASE_URL"] = "sqlite:///./test.db"                                   # MUST be set before the app is imported
+os.environ["JWT_SECRET_KEY"] = "test-only-secret-key-0123456789abcdef0123456789abcdef"  # tests never use your real key
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.db.base import Base
+from app.db.session import engine
+from app.main import app
+
+USER = {"name": "Test User", "email": "test@example.com", "password": "secret123", "mobile": "9876543210"}
+OTHER_USER = {"name": "Other User", "email": "other@example.com", "password": "secret123", "mobile": "9876543211"}
+
+
+def _login_headers(client, user: dict) -> dict:
+    """Log in and return the header every protected request needs."""
+    r = client.post("/api/auth/login", json={"email": user["email"], "password": user["password"]})
+    assert r.status_code == 200
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+
+@pytest.fixture(scope="session")
+def client():
+    """A fake browser that calls our API. Starts from an empty database every run."""
+    Base.metadata.drop_all(bind=engine)              # wipe the previous test run
+    with TestClient(app) as c:                       # 'with' runs startup: create tables + seed products
+        yield c
+
+
+@pytest.fixture(scope="session")
+def registered_user(client):
+    """Register the main test user once."""
+    r = client.post("/api/users/register", json=USER)
+    assert r.status_code == 201
+    return r.json()
+
+
+@pytest.fixture(scope="session")
+def auth_headers(client, registered_user):
+    """Token header for the main user (like clicking Authorize in Swagger)."""
+    return _login_headers(client, USER)
+
+
+@pytest.fixture(scope="session")
+def other_headers(client):
+    """A second customer, used to prove users can't touch each other's data."""
+    r = client.post("/api/users/register", json=OTHER_USER)
