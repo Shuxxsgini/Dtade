@@ -1,0 +1,108 @@
+"""User + auth API tests: register, login, and /me. Uses the fixtures in conftest.py."""
+from sqlalchemy import select
+
+from app.models import User
+
+NEW_USER = {
+    "name": "Kiran R",
+    "email": "kiran@example.com",
+    "password": "kiran1234",
+    "mobile": "9876500000",
+}
+
+
+# ---------- Register (was test_create) ----------
+def test_register(client, db):
+    response = client.post("/api/users/register", json=NEW_USER)
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["name"] == "Kiran R"
+    assert body["email"] == "kiran@example.com"
+    assert "password" not in body                                       # never sent back
+
+    stored = db.scalar(select(User).where(User.email == "kiran@example.com"))
+    assert stored.password != NEW_USER["password"]                      # not plain text in the database
+    assert stored.password.startswith("$argon2")                        # stored as a hash
+
+
+def test_register_duplicate_is_409(client):
+    client.post("/api/users/register", json=NEW_USER)
+
+    response = client.post("/api/users/register", json=NEW_USER)
+
+    assert response.status_code == 409
+
+
+def test_register_email_is_case_insensitive(client):
+    client.post("/api/users/register", json=NEW_USER)
+
+    response = client.post("/api/users/register", json={**NEW_USER, "email": "KIRAN@example.com"})
+
+    assert response.status_code == 409                                  # same email, different capitals
+
+
+def test_register_invalid_input_is_422(client):
+    bad_inputs = [
+        {**NEW_USER, "mobile": "12345"},                                # not 10 digits
+        {**NEW_USER, "password": "short"},                              # under 8 characters
+        {**NEW_USER, "name": "   "},                                    # only spaces
+        {**NEW_USER, "email": "not-an-email"},                          # bad format
+    ]
+    for data in bad_inputs:
+        assert client.post("/api/users/register", json=data).status_code == 422
+
+
+# ---------- Login ----------
+def test_login_returns_token(client):
+    client.post("/api/users/register", json=NEW_USER)
+
+    response = client.post("/api/auth/login", json={"email": NEW_USER["email"], "password": NEW_USER["password"]})
+
+    assert response.status_code == 200
+    assert response.json()["token_type"] == "bearer"
+    assert response.json()["access_token"].count(".") == 2              # header.payload.signature
+
+
+def test_login_wrong_password_is_401(client):
+    client.post("/api/users/register", json=NEW_USER)
+
+    response = client.post("/api/auth/login", json={"email": NEW_USER["email"], "password": "wrongpass1"})
+
+    assert response.status_code == 401
+
+
+def test_login_unknown_email_is_401(client):
+    response = client.post("/api/auth/login", json={"email": "nobody@example.com", "password": "kiran1234"})
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid email or password"    # same message: don't reveal which was wrong
+
+
+# ---------- /me (was test_get / test_list) ----------
+def test_me(client, login_as):
+    client.post("/api/users/register", json=NEW_USER)
+    headers = login_as(NEW_USER)
+
+    response = client.get("/api/users/me", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["email"] == "kiran@example.com"
+    assert "password" not in response.json()
+
+
+def test_me_without_token_is_401(client):
+    response = client.get("/api/users/me")
+
+    assert response.status_code == 401
+
+
+def test_me_shows_only_own_details(client, login_as, registered_user):
+    client.post("/api/users/register", json=NEW_USER)
+
+    kiran = client.get("/api/users/me", headers=login_as(NEW_USER)).json()
+    other = client.get("/api/users/me", headers=login_as({"email": registered_user["email"],
+                                                           "password": "secret123"})).json()
+
+    assert kiran["email"] == "kiran@example.com"
+    assert other["email"] == registered_user["email"]                   # each token sees only its own user
