@@ -1,0 +1,26 @@
+"""Logging & tracing: request ids on every response, errors are traceable, audit lines are written."""
+
+
+def test_every_response_has_request_id(client):
+    r = client.get("/api/products")
+    assert "x-request-id" in r.headers                                   # the sticker is handed back
+
+
+def test_error_body_matches_header_id(client):
+    r = client.get("/api/products/99999")
+    assert r.status_code == 404
+    assert r.json()["request_id"] == r.headers["x-request-id"]           # same sticker in body and header
+
+
+def test_caller_request_id_is_reused(client):
+    r = client.get("/api/products", headers={"X-Request-ID": "trace-123"})
+    assert r.headers["x-request-id"] == "trace-123"                      # we keep the caller's own id
+
+
+def test_checkout_writes_audit_line(client, auth_headers, caplog):
+    caplog.set_level("INFO", logger="app.audit")                         # catch audit log lines in this test
+    client.post("/api/cart/add", json={"product_id": 1, "quantity": 1}, headers=auth_headers)
+    client.post("/api/orders/checkout", json={"payment_method": "UPI"}, headers=auth_headers)
+
+    audit_lines = [rec.getMessage().lower() for rec in caplog.records if rec.name == "app.audit"]
+    assert any("placed" in line for line in audit_lines)                 # the background audit ran
