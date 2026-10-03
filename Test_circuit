@@ -1,0 +1,66 @@
+"""Unit tests: the circuit breaker on its own (no HTTP, no database)."""
+import asyncio
+
+import pytest
+
+from app.core.circuit_breaker import CircuitBreaker, CircuitOpenError
+
+
+async def ok():                            # a fake call that always works
+    return "ok"
+
+
+async def boom():                          # a fake call that always fails
+    raise RuntimeError("provider down")
+
+
+def run(coro):
+    """Run one async call from a normal (sync) test."""
+    return asyncio.run(coro)
+
+
+def test_success_keeps_breaker_closed():
+    breaker = CircuitBreaker(max_failures=3, reset_seconds=30)
+    assert run(breaker.call(ok)) == "ok"
+    assert breaker.state == "closed"
+
+
+def test_opens_after_max_failures():
+    breaker = CircuitBreaker(max_failures=3, reset_seconds=30)
+    for _ in range(3):                                      # fail 3 times in a row
+        with pytest.raises(RuntimeError):
+            run(breaker.call(boom))
+    assert breaker.state == "open"                          # the fuse tripped
+
+
+def test_open_breaker_blocks_without_calling():
+    breaker = CircuitBreaker(max_failures=1, reset_seconds=30)
+    with pytest.raises(RuntimeError):
+        run(breaker.call(boom))                             # 1 failure, so it's open
+
+    calls = []
+
+    async def spy():
+        calls.append(1)
+        return "x"
+
+    with pytest.raises(CircuitOpenError):
+        run(breaker.call(spy))                              # rejected instantly...
+    assert calls == []                                      # ...and the provider was NOT called
+
+
+def test_half_open_success_closes_again():
+    breaker = CircuitBreaker(max_failures=1, reset_seconds=0)   # 0s wait, so trial at once
+    with pytest.raises(RuntimeError):
+        run(breaker.call(boom))
+    assert run(breaker.call(ok)) == "ok"                    # the trial call works...
+    assert breaker.state == "closed"                        # ...so the fuse resets
+
+
+def test_half_open_failure_opens_again():
+    breaker = CircuitBreaker(max_failures=1, reset_seconds=0)
+    with pytest.raises(RuntimeError):
+        run(breaker.call(boom))
+    with pytest.raises(RuntimeError):
+        run(breaker.call(boom))                             # the trial call fails...
+    assert breaker.state == "open"                          # ...so it trips again
