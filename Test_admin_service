@@ -1,0 +1,31 @@
+"""Unit tests: admin rules with a FAKE repository (no database at all)."""
+from unittest.mock import MagicMock
+
+import pytest
+
+from app.schemas.product_schema import CategoryCreate
+from app.services import admin_service
+from app.utils.exceptions import ConflictError, NotFoundError
+
+
+def test_duplicate_category_is_conflict_and_nothing_saved(monkeypatch):
+    monkeypatch.setattr(admin_service.product_repository, "get_category_by_name",
+                        lambda db, name: object())                   # fake: "yes, it already exists"
+    db = MagicMock()                                                  # a fake database session
+    with pytest.raises(ConflictError):
+        admin_service.create_category(db, CategoryCreate(category_name="Toys"))
+    db.commit.assert_not_called()                                     # proof: nothing was saved
+
+
+def test_rename_unknown_category_is_404(monkeypatch):
+    monkeypatch.setattr(admin_service.product_repository, "get_category_by_id",
+                        lambda db, category_id: None)                 # fake: "not found"
+    with pytest.raises(NotFoundError):
+        admin_service.update_category(MagicMock(), 999, CategoryCreate(category_name="Toys"))
+
+
+def test_deactivate_unknown_product_is_404(monkeypatch):
+    monkeypatch.setattr(admin_service.product_repository, "get_product_by_id",
+                        lambda db, product_id, include_inactive=False: None)
+    with pytest.raises(NotFoundError):
+        admin_service.deactivate_service(MagicMock(), 999)            # use YOUR function name
