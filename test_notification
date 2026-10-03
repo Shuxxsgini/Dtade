@@ -1,0 +1,101 @@
+"""Unit tests: timeout, retry, breaker and fallback, with a FAKE provider (no real HTTP)."""
+import asyncio
+
+import httpx
+import pytest
+
+from app.core.circuit_breaker import CircuitBreaker
+from app.services import notification_service as ns
+from app.services.notification_service import notify as real_notify  # the REAL notify (grabbed before conftest swaps it for a fake)
+
+REQUEST = httpx.Request("POST", "http://provider/notify")
+
+
+def http_error(status: int) -> httpx.HTTPStatusError:
+    """Build the error httpx raises for a bad status, e.g. 503 or 400."""
+    return httpx.HTTPStatusError("error", request=REQUEST, response=httpx.Response(status, request=REQUEST))
+
+
+@pytest.fixture(autouse=True)
+def fresh_and_fast(monkeypatch):
+    """Every test: a brand-new breaker, and no real waiting between retries."""
+    monkeypatch.setattr(ns, "RETRY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(ns, "provider_breaker", CircuitBreaker(max_failures=3, reset_seconds=30))
+
+
+def fake_provider(monkeypatch, outcomes: list) -> list:
+    """Replace the real HTTP call. outcomes = one entry per attempt: None = success, or an error to raise."""
+    calls = []
+
+    async def fake_send(to: str, message: str) -> None:
+        outcome = outcomes[len(calls)]
+        calls.append(to)                              # remember every attempt
+        if outcome is not None:
+            raise outcome
+
+    monkeypatch.setattr(ns, "send_to_provider", fake_send)
+    return calls
+
+
+def test_sent_first_try(monkeypatch):
+    calls = fake_provider(monkeypatch, [None])
+    assert asyncio.run(real_notify("a@b.com", "hi")) is True
+    assert len(calls) == 1
+
+
+def test_retry_recovers(monkeypatch):
+    calls = fake_provider(monkeypatch, [httpx.ConnectError("down"), httpx.ConnectError("down"), None])
+    assert asyncio.run(real_notify("a@b.com", "hi")) is True          # fails twice, works on attempt 3
+    assert len(calls) == 3
+
+
+def test_gives_up_after_three_5xx(monkeypatch):
+    calls = fake_provider(monkeypatch, [http_error(503)] * 3)
+    assert asyncio.run(real_notify("a@b.com", "hi")) is False         # fallback: False, never a crash
+    assert len(calls) == 3                                            # retried exactly 3 times
+
+
+def test_timeout_is_retried(monkeypatch):
+    calls = fake_provider(monkeypatch, [httpx.ReadTimeout("slow")] * 3)
+    assert asyncio.run(real_notify("a@b.com", "hi")) is False
+    assert len(calls) == 3
+
+
+def test_4xx_is_not_retried(monkeypatch):
+    calls = fake_provider(monkeypatch, [http_error(400)])
+    assert asyncio.run(real_notify("a@b.com", "hi")) is False
+    assert len(calls) == 1                                            # our mistake, so retrying is pointless
+
+
+def test_breaker_skips_provider_after_repeated_failures(monkeypatch):
+    calls = fake_provider(monkeypatch, [http_error(503)] * 9)
+    for _ in range(3):
+        asyncio.run(real_notify("a@b.com", "hi"))                     # 3 failed notifications = 9 attempts
+    assert len(calls) == 9
+
+    assert asyncio.run(real_notify("a@b.com", "hi")) is False         # breaker open...
+    assert len(calls) == 9                                            # ...so the provider was NOT called again
+
+
+def test_send_to_provider_posts_json(monkeypatch):
+    """The one real HTTP function, tested with httpx's built-in fake network."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = request.content
+        return httpx.Response(200, json={"status": "sent"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(ns.httpx, "AsyncClient",
+                        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+
+    asyncio.run(ns.send_to_provider("a@b.com", "hi"))
+    assert b'"to"' in seen["body"] and b"a@b.com" in seen["body"]    # we sent the right JSON
+
+
+def test_send_to_provider_raises_on_503(monkeypatch):
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(ns.httpx, "AsyncClient",
+                        lambda **kw: real_client(transport=httpx.MockTransport(lambda r: httpx.Response(503)), **kw))
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(ns.send_to_provider("a@b.com", "hi"))
