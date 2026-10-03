@@ -1,0 +1,21 @@
+"""Background tasks after checkout: the notification is sent AFTER the response, and never breaks the order."""
+from app.services import notification_service
+
+
+def test_checkout_sends_confirmation_in_background(client, auth_headers, sent_notifications):
+    client.post("/api/cart/add", json={"product_id": 1, "quantity": 1}, headers=auth_headers)
+    r = client.post("/api/orders/checkout", json={"payment_method": "UPI"}, headers=auth_headers)
+    assert r.status_code == 201
+    assert len(sent_notifications) == 1                                    # exactly one notification
+    assert f"#{r.json()['order_id']}" in sent_notifications[0]["message"]  # about THIS order
+
+
+def test_checkout_works_even_if_notification_fails(client, auth_headers, monkeypatch):
+    async def provider_down(to: str, message: str) -> bool:
+        return False                                                       # pretend the provider is down
+    monkeypatch.setattr(notification_service, "notify", provider_down)
+
+    client.post("/api/cart/add", json={"product_id": 1, "quantity": 1}, headers=auth_headers)
+    r = client.post("/api/orders/checkout", json={"payment_method": "UPI"}, headers=auth_headers)
+    assert r.status_code == 201                                            # order still placed
+    assert client.get("/api/cart", headers=auth_headers).json() == []      # cart still emptied
